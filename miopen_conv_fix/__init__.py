@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 _IS_ROCM = (
     torch.cuda.is_available()
@@ -77,33 +77,43 @@ def conv_transpose1d(
     return F.conv_transpose1d(input, weight, bias, stride, padding, output_padding, groups, dilation)
 
 
-def _make_conv1d_forward():
-    """Create a patched forward method for nn.Conv1d."""
+def _make_conv1d_forward(orig_forward):
+    """Create a patched forward method for nn.Conv1d with fallback."""
     def forward(self, input):
-        weight = self.weight.clone()
-        bias = self.bias.clone() if self.bias is not None else None
-        return conv1d(
-            input, weight, bias,
-            self.stride[0], self.padding[0], self.dilation[0], self.groups,
-        )
+        try:
+            weight = self.weight.detach().clone()
+            bias = self.bias.detach().clone() if self.bias is not None else None
+            inp = input.detach().clone()
+            s = [self.stride[0]]
+            p = [self.padding[0]]
+            d = [self.dilation[0]]
+            result = conv1d_forward(inp, weight, bias, s, p, d, self.groups)
+            return result
+        except RuntimeError:
+            return orig_forward(self, input)
     return forward
 
 
-def _make_convt1d_forward():
-    """Create a patched forward method for nn.ConvTranspose1d."""
+def _make_convt1d_forward(orig_forward):
+    """Create a patched forward method for nn.ConvTranspose1d with fallback."""
     def forward(self, input, output_size=None):
-        output_padding = self._output_padding(
-            input, output_size, self.stride, self.padding, self.kernel_size,
-            self.dilation,
-        ) if output_size is not None else self.output_padding
-        weight = self.weight.clone()
-        bias = self.bias.clone() if self.bias is not None else None
-        return conv_transpose1d(
-            input, weight, bias,
-            self.stride[0], self.padding[0],
-            output_padding[0] if isinstance(output_padding, (list, tuple)) else output_padding,
-            self.groups, self.dilation[0],
-        )
+        try:
+            output_padding = self._output_padding(
+                input, output_size, self.stride, self.padding, self.kernel_size,
+                self.dilation,
+            ) if output_size is not None else self.output_padding
+            weight = self.weight.detach().clone()
+            bias = self.bias.detach().clone() if self.bias is not None else None
+            inp = input.detach().clone()
+            s = [self.stride[0]]
+            p = [self.padding[0]]
+            op_val = output_padding[0] if isinstance(output_padding, (list, tuple)) else output_padding
+            op = [op_val]
+            d = [self.dilation[0]]
+            result = conv_transpose1d_forward(inp, weight, bias, s, p, op, self.groups, d)
+            return result
+        except RuntimeError:
+            return orig_forward(self, input, output_size)
     return forward
 
 
@@ -123,18 +133,17 @@ def patch_module(module: nn.Module):
         )
         return 0
 
+    import types
     count = 0
-    conv1d_fwd = _make_conv1d_forward()
-    convt1d_fwd = _make_convt1d_forward()
 
     for name, child in module.named_modules():
         if isinstance(child, nn.ConvTranspose1d):
-            import types
-            child.forward = types.MethodType(convt1d_fwd, child)
+            orig = type(child).forward
+            child.forward = types.MethodType(_make_convt1d_forward(orig), child)
             count += 1
         elif isinstance(child, nn.Conv1d):
-            import types
-            child.forward = types.MethodType(conv1d_fwd, child)
+            orig = type(child).forward
+            child.forward = types.MethodType(_make_conv1d_forward(orig), child)
             count += 1
 
     import logging
