@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 _IS_ROCM = (
     torch.cuda.is_available()
@@ -45,14 +45,15 @@ def conv1d(
 ) -> torch.Tensor:
     """Drop-in replacement for F.conv1d with proper MIOpen workspace on ROCm."""
     if _HAS_EXT and input.is_cuda:
-        # .contiguous() materializes parametrized weights (e.g. weight_norm)
-        weight = weight.contiguous()
+        # .clone() forces materialization of parametrized/lazy tensors
+        # .contiguous() alone is not sufficient for TorchScript outputs
+        weight = weight.clone()
         if bias is not None:
-            bias = bias.contiguous()
+            bias = bias.clone()
         s = [stride] if isinstance(stride, int) else list(stride)
         p = [padding] if isinstance(padding, int) else list(padding)
         d = [dilation] if isinstance(dilation, int) else list(dilation)
-        return conv1d_forward(input.contiguous(), weight, bias, s, p, d, groups)
+        return conv1d_forward(input.clone(), weight, bias, s, p, d, groups)
     return F.conv1d(input, weight, bias, stride, padding, dilation, groups)
 
 
@@ -75,7 +76,7 @@ def conv_transpose1d(
         p = [padding] if isinstance(padding, int) else list(padding)
         op = [output_padding] if isinstance(output_padding, int) else list(output_padding)
         d = [dilation] if isinstance(dilation, int) else list(dilation)
-        return conv_transpose1d_forward(input.contiguous(), weight, bias, s, p, op, groups, d)
+        return conv_transpose1d_forward(input.clone(), weight, bias, s, p, op, groups, d)
     return F.conv_transpose1d(input, weight, bias, stride, padding, output_padding, groups, dilation)
 
 
@@ -105,10 +106,9 @@ def patch():
     _orig_convt1d_forward = nn.ConvTranspose1d.forward
 
     def _conv1d_forward(self, input):
-        # .contiguous() materializes parametrized weights (e.g. weight_norm)
-        # into a tensor with storage that MIOpen can access.
-        weight = self.weight.contiguous()
-        bias = self.bias.contiguous() if self.bias is not None else None
+        # .clone() forces materialization of parametrized/TorchScript tensors
+        weight = self.weight.clone()
+        bias = self.bias.clone() if self.bias is not None else None
         return conv1d(
             input, weight, bias,
             self.stride[0], self.padding[0], self.dilation[0], self.groups,
