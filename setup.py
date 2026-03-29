@@ -36,7 +36,11 @@ if _IS_ROCM:
             ],
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],
-                "nvcc": ["-O3", "-std=c++17"],
+                "nvcc": [
+                    "-O3", "-std=c++17",
+                    f"-I{os.path.join(rocm_home, 'include', 'rocthrust')}",
+                    f"-I{os.path.join(rocm_home, 'include', 'rocprim')}",
+                ],
             },
         )
     ]
