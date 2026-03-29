@@ -27,6 +27,8 @@ if _IS_ROCM:
             ],
             include_dirs=[
                 os.path.join(rocm_home, "include"),
+                os.path.join(rocm_home, "include", "rocthrust"),
+                os.path.join(rocm_home, "include", "rocprim"),
             ],
             libraries=["MIOpen"],
             library_dirs=[

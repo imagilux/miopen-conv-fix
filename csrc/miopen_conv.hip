@@ -1,6 +1,11 @@
 #include <torch/extension.h>
-#include <ATen/hip/HIPContext.h>
 #include <miopen/miopen.h>
+
+// Forward-declare getMiopenHandle to avoid pulling in ATen/hip/HIPContext.h
+// which transitively includes thrust headers that may not be on the include path.
+namespace at { namespace native {
+    miopenHandle_t getMiopenHandle();
+}}
 
 #include <unordered_map>
 #include <mutex>
