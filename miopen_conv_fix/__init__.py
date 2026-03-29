@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 _IS_ROCM = (
     torch.cuda.is_available()
