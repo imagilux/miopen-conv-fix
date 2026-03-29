@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 _IS_ROCM = (
     torch.cuda.is_available()
@@ -45,10 +45,14 @@ def conv1d(
 ) -> torch.Tensor:
     """Drop-in replacement for F.conv1d with proper MIOpen workspace on ROCm."""
     if _HAS_EXT and input.is_cuda:
+        # .contiguous() materializes parametrized weights (e.g. weight_norm)
+        weight = weight.contiguous()
+        if bias is not None:
+            bias = bias.contiguous()
         s = [stride] if isinstance(stride, int) else list(stride)
         p = [padding] if isinstance(padding, int) else list(padding)
         d = [dilation] if isinstance(dilation, int) else list(dilation)
-        return conv1d_forward(input, weight, bias, s, p, d, groups)
+        return conv1d_forward(input.contiguous(), weight, bias, s, p, d, groups)
     return F.conv1d(input, weight, bias, stride, padding, dilation, groups)
 
 
@@ -64,11 +68,14 @@ def conv_transpose1d(
 ) -> torch.Tensor:
     """Drop-in replacement for F.conv_transpose1d with proper MIOpen workspace on ROCm."""
     if _HAS_EXT and input.is_cuda:
+        weight = weight.contiguous()
+        if bias is not None:
+            bias = bias.contiguous()
         s = [stride] if isinstance(stride, int) else list(stride)
         p = [padding] if isinstance(padding, int) else list(padding)
         op = [output_padding] if isinstance(output_padding, int) else list(output_padding)
         d = [dilation] if isinstance(dilation, int) else list(dilation)
-        return conv_transpose1d_forward(input, weight, bias, s, p, op, groups, d)
+        return conv_transpose1d_forward(input.contiguous(), weight, bias, s, p, op, groups, d)
     return F.conv_transpose1d(input, weight, bias, stride, padding, output_padding, groups, dilation)
 
 
