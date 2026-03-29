@@ -1,0 +1,51 @@
+name: Build ROCm Wheel
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.8.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends \
+            rocthrust-dev miopen-hip-dev
+          pip install setuptools wheel build
+
+      - name: Build wheel
+        run: |
+          pip wheel . --no-deps --no-build-isolation -w dist/
+          ls -lh dist/
+
+      - name: Test import
+        run: |
+          pip install dist/miopen_conv_fix*.whl
+          python -c "
+          import miopen_conv_fix
+          print('EXT:', miopen_conv_fix._HAS_EXT)
+          print('ROCM:', miopen_conv_fix._IS_ROCM)
+          assert miopen_conv_fix._HAS_EXT, 'C extension not loaded!'
+          print('OK: C extension compiled and loaded')
+          "
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: miopen-conv-fix-rocm72-wheel
+          path: dist/miopen_conv_fix*.whl
+
+      - name: Create release (on tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/miopen_conv_fix*.whl
+          generate_release_notes: true
