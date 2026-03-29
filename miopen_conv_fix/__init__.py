@@ -98,8 +98,12 @@ def patch():
     _orig_convt1d_forward = nn.ConvTranspose1d.forward
 
     def _conv1d_forward(self, input):
+        # .contiguous() materializes parametrized weights (e.g. weight_norm)
+        # into a tensor with storage that MIOpen can access.
+        weight = self.weight.contiguous()
+        bias = self.bias.contiguous() if self.bias is not None else None
         return conv1d(
-            input, self.weight, self.bias,
+            input, weight, bias,
             self.stride[0], self.padding[0], self.dilation[0], self.groups,
         )
 
@@ -108,8 +112,10 @@ def patch():
             input, output_size, self.stride, self.padding, self.kernel_size,
             self.dilation, # type: ignore[arg-type]
         ) if output_size is not None else self.output_padding
+        weight = self.weight.contiguous()
+        bias = self.bias.contiguous() if self.bias is not None else None
         return conv_transpose1d(
-            input, self.weight, self.bias,
+            input, weight, bias,
             self.stride[0], self.padding[0],
             output_padding[0] if isinstance(output_padding, (list, tuple)) else output_padding,
             self.groups, self.dilation[0],
