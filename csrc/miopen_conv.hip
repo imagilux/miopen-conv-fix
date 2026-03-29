@@ -28,6 +28,38 @@ static miopenDataType_t get_miopen_dtype(at::ScalarType type) {
     }
 }
 
+// ---- Tensor materialization ----
+// Parametrized tensors (weight_norm), TorchScript outputs, torch.compile
+// functionalized tensors, and certain views may not have accessible storage.
+// .contiguous() and .clone() do NOT always fix this — they can return
+// subclass tensors that inherit the storage-less property.
+//
+// The only guaranteed fix: allocate a fresh tensor and copy_ into it.
+// This forces a real HIP allocation + a memcpy, no subclass wrappers.
+
+static torch::Tensor force_materialize(const torch::Tensor& t) {
+    auto fresh = torch::empty(t.sizes(), t.options().memory_format(torch::MemoryFormat::Contiguous));
+    fresh.copy_(t);
+    return fresh;
+}
+
+// Materialize only if needed — check storage accessibility first.
+// Falls back to force_materialize if .data_ptr() would fail.
+static torch::Tensor ensure_data_ptr(const torch::Tensor& t) {
+    // Fast path: tensor already has accessible storage
+    try {
+        if (t.defined() && t.is_contiguous() && t.has_storage() &&
+            t.storage().data_ptr().get() != nullptr) {
+            // Verify we can actually access the pointer (catches functorch wrappers)
+            (void)t.data_ptr();
+            return t;
+        }
+    } catch (...) {
+        // Fall through to materialization
+    }
+    return force_materialize(t);
+}
+
 // ---- Algorithm cache ----
 
 struct ConvKey {
@@ -127,18 +159,20 @@ torch::Tensor miopen_conv1d_forward(
     int d = dilation[0];
     int g = groups;
 
-    // Ensure inputs have storage (parametrized/TorchScript tensors may not)
-    auto input_c = input.contiguous();
-    auto weight_c = weight.contiguous();
+    // Materialize tensors — guarantees accessible .data_ptr()
+    auto input_c = ensure_data_ptr(input);
+    auto weight_c = ensure_data_ptr(weight);
 
-    // Reshape 1D → 2D (H=1) using view (no copy, just metadata)
+    // Reshape 1D → 2D (H=1) for MIOpen 4D descriptor interface.
+    // Since input_c and weight_c are materialized + contiguous,
+    // .view() will produce a valid view with the same storage.
     auto input_2d = input_c.view({N, C_in, 1, L_in});
     auto weight_2d = weight_c.view({C_out, C_in / g, 1, K});
 
     // Compute output length
     int L_out = (L_in + 2 * p - d * (K - 1) - 1) / s + 1;
 
-    // Create output tensor
+    // Create output tensor (fresh allocation, always has storage)
     auto output_2d = torch::empty({N, C_out, 1, L_out}, input_c.options());
 
     // Setup descriptors
@@ -179,7 +213,7 @@ torch::Tensor miopen_conv1d_forward(
 
         // Allocate workspace
         auto workspace = torch::empty({static_cast<int64_t>(ws_size)},
-                                       input.options().dtype(torch::kByte));
+                                       input_c.options().dtype(torch::kByte));
 
         // Find best algorithm
         int algo_count = 0;
@@ -205,7 +239,7 @@ torch::Tensor miopen_conv1d_forward(
 
     // Allocate workspace for execution
     auto workspace = torch::empty({static_cast<int64_t>(cached.workspace_size)},
-                                   input.options().dtype(torch::kByte));
+                                   input_c.options().dtype(torch::kByte));
 
     // Execute convolution
     float alpha = 1.0f, beta = 0.0f;
@@ -223,7 +257,8 @@ torch::Tensor miopen_conv1d_forward(
 
     // Add bias if present
     if (bias.has_value() && bias->defined()) {
-        output = output + bias->unsqueeze(0).unsqueeze(2);
+        auto bias_c = ensure_data_ptr(*bias);
+        output = output + bias_c.unsqueeze(0).unsqueeze(2);
     }
 
     return output;
@@ -263,9 +298,9 @@ torch::Tensor miopen_conv_transpose1d_forward(
     // Compute output length
     int L_out = (L_in - 1) * s - 2 * p + d * (K - 1) + op + 1;
 
-    // Ensure inputs have storage
-    auto input_c = input.contiguous();
-    auto weight_c = weight.contiguous();
+    // Materialize tensors
+    auto input_c = ensure_data_ptr(input);
+    auto weight_c = ensure_data_ptr(weight);
 
     // Reshape 1D → 2D (H=1)
     auto input_2d = input_c.view({N, C_in, 1, L_in});
@@ -309,7 +344,7 @@ torch::Tensor miopen_conv_transpose1d_forward(
             handle, dy_desc.desc, w_desc.desc, conv_desc.desc, dx_desc.desc, &ws_size);
 
         auto workspace = torch::empty({static_cast<int64_t>(ws_size)},
-                                       input.options().dtype(torch::kByte));
+                                       input_c.options().dtype(torch::kByte));
 
         int algo_count = 0;
         miopenConvAlgoPerf_t perf[4];
@@ -333,7 +368,7 @@ torch::Tensor miopen_conv_transpose1d_forward(
     }
 
     auto workspace = torch::empty({static_cast<int64_t>(cached.workspace_size)},
-                                   input.options().dtype(torch::kByte));
+                                   input_c.options().dtype(torch::kByte));
 
     float alpha = 1.0f, beta = 0.0f;
     miopenConvolutionBackwardData(
@@ -348,7 +383,8 @@ torch::Tensor miopen_conv_transpose1d_forward(
     auto output = output_2d.squeeze(2);
 
     if (bias.has_value() && bias->defined()) {
-        output = output + bias->unsqueeze(0).unsqueeze(2);
+        auto bias_c = ensure_data_ptr(*bias);
+        output = output + bias_c.unsqueeze(0).unsqueeze(2);
     }
 
     return output;

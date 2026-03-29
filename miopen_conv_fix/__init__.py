@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-__version__ = "0.1.6"
+__version__ = "0.2.0"
 
 _IS_ROCM = (
     torch.cuda.is_available()
@@ -43,14 +43,11 @@ def conv1d(
 ) -> torch.Tensor:
     """Drop-in replacement for F.conv1d with proper MIOpen workspace on ROCm."""
     if _HAS_EXT and input.is_cuda:
-        # .clone() forces materialization of parametrized/lazy tensors
-        weight = weight.clone()
-        if bias is not None:
-            bias = bias.clone()
         s = [stride] if isinstance(stride, int) else list(stride)
         p = [padding] if isinstance(padding, int) else list(padding)
         d = [dilation] if isinstance(dilation, int) else list(dilation)
-        return conv1d_forward(input.clone(), weight, bias, s, p, d, groups)
+        # C++ ensure_data_ptr() handles tensor materialization internally
+        return conv1d_forward(input, weight, bias, s, p, d, groups)
     return F.conv1d(input, weight, bias, stride, padding, dilation, groups)
 
 
@@ -66,14 +63,11 @@ def conv_transpose1d(
 ) -> torch.Tensor:
     """Drop-in replacement for F.conv_transpose1d with proper MIOpen workspace on ROCm."""
     if _HAS_EXT and input.is_cuda:
-        weight = weight.clone()
-        if bias is not None:
-            bias = bias.clone()
         s = [stride] if isinstance(stride, int) else list(stride)
         p = [padding] if isinstance(padding, int) else list(padding)
         op = [output_padding] if isinstance(output_padding, int) else list(output_padding)
         d = [dilation] if isinstance(dilation, int) else list(dilation)
-        return conv_transpose1d_forward(input.clone(), weight, bias, s, p, op, groups, d)
+        return conv_transpose1d_forward(input, weight, bias, s, p, op, groups, d)
     return F.conv_transpose1d(input, weight, bias, stride, padding, output_padding, groups, dilation)
 
 
@@ -81,15 +75,17 @@ def _make_conv1d_forward(orig_forward):
     """Create a patched forward method for nn.Conv1d with fallback."""
     def forward(self, input):
         try:
-            weight = self.weight.detach().clone()
-            bias = self.bias.detach().clone() if self.bias is not None else None
-            inp = input.detach().clone()
             s = [self.stride[0]]
             p = [self.padding[0]]
             d = [self.dilation[0]]
-            result = conv1d_forward(inp, weight, bias, s, p, d, self.groups)
-            return result
-        except RuntimeError:
+            # Pass self.weight directly — C++ materializes if needed
+            return conv1d_forward(input, self.weight, self.bias, s, p, d, self.groups)
+        except RuntimeError as e:
+            # Fallback to original PyTorch conv (slow but safe)
+            import logging
+            logging.getLogger("miopen_conv_fix").debug(
+                f"Fallback to PyTorch conv: {e}"
+            )
             return orig_forward(self, input)
     return forward
 
@@ -102,17 +98,17 @@ def _make_convt1d_forward(orig_forward):
                 input, output_size, self.stride, self.padding, self.kernel_size,
                 self.dilation,
             ) if output_size is not None else self.output_padding
-            weight = self.weight.detach().clone()
-            bias = self.bias.detach().clone() if self.bias is not None else None
-            inp = input.detach().clone()
             s = [self.stride[0]]
             p = [self.padding[0]]
             op_val = output_padding[0] if isinstance(output_padding, (list, tuple)) else output_padding
             op = [op_val]
             d = [self.dilation[0]]
-            result = conv_transpose1d_forward(inp, weight, bias, s, p, op, self.groups, d)
-            return result
-        except RuntimeError:
+            return conv_transpose1d_forward(input, self.weight, self.bias, s, p, op, self.groups, d)
+        except RuntimeError as e:
+            import logging
+            logging.getLogger("miopen_conv_fix").debug(
+                f"Fallback to PyTorch conv_transpose: {e}"
+            )
             return orig_forward(self, input, output_size)
     return forward
 
