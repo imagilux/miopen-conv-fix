@@ -127,15 +127,19 @@ torch::Tensor miopen_conv1d_forward(
     int d = dilation[0];
     int g = groups;
 
-    // Reshape 1D → 2D (H=1)
-    auto input_2d = input.unsqueeze(2);   // (N, C_in, 1, L_in)
-    auto weight_2d = weight.unsqueeze(2); // (C_out, C_in/g, 1, K)
+    // Ensure inputs have storage (parametrized/TorchScript tensors may not)
+    auto input_c = input.contiguous();
+    auto weight_c = weight.contiguous();
+
+    // Reshape 1D → 2D (H=1) using view (no copy, just metadata)
+    auto input_2d = input_c.view({N, C_in, 1, L_in});
+    auto weight_2d = weight_c.view({C_out, C_in / g, 1, K});
 
     // Compute output length
     int L_out = (L_in + 2 * p - d * (K - 1) - 1) / s + 1;
 
     // Create output tensor
-    auto output_2d = torch::empty({N, C_out, 1, L_out}, input.options());
+    auto output_2d = torch::empty({N, C_out, 1, L_out}, input_c.options());
 
     // Setup descriptors
     TensorDesc x_desc, w_desc, y_desc;
@@ -259,10 +263,14 @@ torch::Tensor miopen_conv_transpose1d_forward(
     // Compute output length
     int L_out = (L_in - 1) * s - 2 * p + d * (K - 1) + op + 1;
 
+    // Ensure inputs have storage
+    auto input_c = input.contiguous();
+    auto weight_c = weight.contiguous();
+
     // Reshape 1D → 2D (H=1)
-    auto input_2d = input.unsqueeze(2);
-    auto weight_2d = weight.unsqueeze(2);
-    auto output_2d = torch::empty({N, C_out, 1, L_out}, input.options());
+    auto input_2d = input_c.view({N, C_in, 1, L_in});
+    auto weight_2d = weight_c.view({C_in / g, C_out / g, 1, K});
+    auto output_2d = torch::empty({N, C_out, 1, L_out}, input_c.options());
 
     // For ConvTranspose, the descriptors are reversed:
     // "input" to backward-data is the transposed conv's input
