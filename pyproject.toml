@@ -14,3 +14,7 @@ dependencies = ["torch>=2.4.0"]
 [project.urls]
 Repository = "https://github.com/Imagilux/miopen-conv-fix"
 Issues = "https://github.com/Imagilux/miopen-conv-fix/issues"
+
+[tool.setuptools.packages.find]
+include = ["miopen_conv_fix*"]
+exclude = ["csrc*"]
