@@ -5,7 +5,7 @@ forcing fallback to ConvDirectNaiveConvFwd (~10-12x slower).
 
 Usage:
     import miopen_conv_fix
-    miopen_conv_fix.patch()  # Monkey-patches nn.Conv1d and nn.ConvTranspose1d
+    miopen_conv_fix.patch_module(model)  # Patch conv layers in a specific module
 """
 
 import torch
@@ -20,8 +20,6 @@ _IS_ROCM = (
     and hasattr(torch.version, "hip")
     and torch.version.hip is not None
 )
-
-_patched = False
 
 if _IS_ROCM:
     try:
@@ -46,7 +44,6 @@ def conv1d(
     """Drop-in replacement for F.conv1d with proper MIOpen workspace on ROCm."""
     if _HAS_EXT and input.is_cuda:
         # .clone() forces materialization of parametrized/lazy tensors
-        # .contiguous() alone is not sufficient for TorchScript outputs
         weight = weight.clone()
         if bias is not None:
             bias = bias.clone()
@@ -69,9 +66,9 @@ def conv_transpose1d(
 ) -> torch.Tensor:
     """Drop-in replacement for F.conv_transpose1d with proper MIOpen workspace on ROCm."""
     if _HAS_EXT and input.is_cuda:
-        weight = weight.contiguous()
+        weight = weight.clone()
         if bias is not None:
-            bias = bias.contiguous()
+            bias = bias.clone()
         s = [stride] if isinstance(stride, int) else list(stride)
         p = [padding] if isinstance(padding, int) else list(padding)
         op = [output_padding] if isinstance(output_padding, int) else list(output_padding)
@@ -80,74 +77,78 @@ def conv_transpose1d(
     return F.conv_transpose1d(input, weight, bias, stride, padding, output_padding, groups, dilation)
 
 
-# Store original forward methods for unpatching
-_orig_conv1d_forward = None
-_orig_convt1d_forward = None
-
-
-def patch():
-    """Monkey-patch nn.Conv1d and nn.ConvTranspose1d to use MIOpen with proper workspace.
-
-    Only activates on ROCm with the C extension available. No-op on CUDA/CPU.
-    """
-    global _patched, _orig_conv1d_forward, _orig_convt1d_forward
-
-    if _patched:
-        return
-
-    if not _HAS_EXT:
-        import logging
-        logging.getLogger(__name__).info(
-            "miopen-conv-fix: not on ROCm or C extension not available, patch is a no-op"
-        )
-        return
-
-    _orig_conv1d_forward = nn.Conv1d.forward
-    _orig_convt1d_forward = nn.ConvTranspose1d.forward
-
-    def _conv1d_forward(self, input):
-        # .clone() forces materialization of parametrized/TorchScript tensors
+def _make_conv1d_forward():
+    """Create a patched forward method for nn.Conv1d."""
+    def forward(self, input):
         weight = self.weight.clone()
         bias = self.bias.clone() if self.bias is not None else None
         return conv1d(
             input, weight, bias,
             self.stride[0], self.padding[0], self.dilation[0], self.groups,
         )
+    return forward
 
-    def _convt1d_forward(self, input, output_size=None):
+
+def _make_convt1d_forward():
+    """Create a patched forward method for nn.ConvTranspose1d."""
+    def forward(self, input, output_size=None):
         output_padding = self._output_padding(
             input, output_size, self.stride, self.padding, self.kernel_size,
-            self.dilation, # type: ignore[arg-type]
+            self.dilation,
         ) if output_size is not None else self.output_padding
-        weight = self.weight.contiguous()
-        bias = self.bias.contiguous() if self.bias is not None else None
+        weight = self.weight.clone()
+        bias = self.bias.clone() if self.bias is not None else None
         return conv_transpose1d(
             input, weight, bias,
             self.stride[0], self.padding[0],
             output_padding[0] if isinstance(output_padding, (list, tuple)) else output_padding,
             self.groups, self.dilation[0],
         )
+    return forward
 
-    nn.Conv1d.forward = _conv1d_forward
-    nn.ConvTranspose1d.forward = _convt1d_forward
-    _patched = True
+
+def patch_module(module: nn.Module):
+    """Patch Conv1d and ConvTranspose1d layers within a specific module.
+
+    Only patches layers inside the given module, not globally. This avoids
+    breaking other models (e.g., VQ quantizer) that use small Conv1d layers
+    where the workspace fix isn't needed.
+
+    Only activates on ROCm with the C extension available. No-op otherwise.
+    """
+    if not _HAS_EXT:
+        import logging
+        logging.getLogger(__name__).info(
+            "miopen-conv-fix: not on ROCm or C extension not available, patch_module is a no-op"
+        )
+        return 0
+
+    count = 0
+    conv1d_fwd = _make_conv1d_forward()
+    convt1d_fwd = _make_convt1d_forward()
+
+    for name, child in module.named_modules():
+        if isinstance(child, nn.ConvTranspose1d):
+            import types
+            child.forward = types.MethodType(convt1d_fwd, child)
+            count += 1
+        elif isinstance(child, nn.Conv1d):
+            import types
+            child.forward = types.MethodType(conv1d_fwd, child)
+            count += 1
 
     import logging
     logging.getLogger(__name__).info(
-        "miopen-conv-fix: patched nn.Conv1d and nn.ConvTranspose1d for MIOpen workspace fix"
+        f"miopen-conv-fix: patched {count} Conv1d/ConvTranspose1d layers in {type(module).__name__}"
     )
+    return count
 
 
-def unpatch():
-    """Restore original nn.Conv1d and nn.ConvTranspose1d forward methods."""
-    global _patched, _orig_conv1d_forward, _orig_convt1d_forward
-
-    if not _patched:
-        return
-
-    if _orig_conv1d_forward is not None:
-        nn.Conv1d.forward = _orig_conv1d_forward
-    if _orig_convt1d_forward is not None:
-        nn.ConvTranspose1d.forward = _orig_convt1d_forward
-
-    _patched = False
+# Keep patch() for backwards compatibility but make it target-specific
+def patch():
+    """DEPRECATED: Use patch_module(model) instead to avoid patching unrelated Conv1d layers."""
+    import logging
+    logging.getLogger(__name__).warning(
+        "miopen_conv_fix.patch() patches ALL Conv1d globally which can break other models. "
+        "Use miopen_conv_fix.patch_module(model) to patch a specific model instead."
+    )
