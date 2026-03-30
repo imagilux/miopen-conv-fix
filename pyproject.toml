@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "miopen-conv-fix"
-version = "0.2.0"
+version = "0.3.0"
 description = "PyTorch C++ extension fixing MIOpen workspace=0 bug for 1D convolutions on ROCm"
 readme = "README.md"
-license = "MIT"
+license = {text = "MIT"}
 requires-python = ">=3.10"
 dependencies = ["torch>=2.4.0"]
 

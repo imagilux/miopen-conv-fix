@@ -3,6 +3,9 @@
 Fixes pytorch/pytorch#150168 where PyTorch passes workspace=0 to MIOpen,
 forcing fallback to ConvDirectNaiveConvFwd (~10-12x slower).
 
+Uses MIOpen's Immediate Mode API with per-solution validation to avoid
+segfaults from broken kernels on immature architectures (e.g. gfx1201).
+
 Usage:
     import miopen_conv_fix
     miopen_conv_fix.patch_module(model)  # Patch conv layers in a specific module
@@ -13,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 _IS_ROCM = (
     torch.cuda.is_available()
@@ -23,13 +26,39 @@ _IS_ROCM = (
 
 if _IS_ROCM:
     try:
-        from miopen_conv_fix._C import conv1d_forward, conv_transpose1d_forward
+        from miopen_conv_fix._C import (
+            conv1d_forward,
+            conv_transpose1d_forward,
+            add_solver_blacklist,
+            clear_solver_blacklist,
+            clear_algo_cache,
+        )
 
         _HAS_EXT = True
     except ImportError:
         _HAS_EXT = False
 else:
     _HAS_EXT = False
+
+# Known-bad solver IDs per GPU architecture.
+# Populated as specific failures are identified. Use "*" for all architectures.
+_KNOWN_BAD_SOLVERS: dict[str, list[int]] = {
+    # "gfx1201": [<solution_id>, ...],
+}
+
+
+def apply_default_blacklist():
+    """Apply known-bad solver blacklists for the current GPU."""
+    if not _HAS_EXT:
+        return
+    for arch, sol_ids in _KNOWN_BAD_SOLVERS.items():
+        for sid in sol_ids:
+            add_solver_blacklist(arch, sid)
+
+
+# Apply at import time so blacklists are active before any conv runs
+if _HAS_EXT:
+    apply_default_blacklist()
 
 
 def conv1d(
@@ -46,7 +75,6 @@ def conv1d(
         s = [stride] if isinstance(stride, int) else list(stride)
         p = [padding] if isinstance(padding, int) else list(padding)
         d = [dilation] if isinstance(dilation, int) else list(dilation)
-        # C++ ensure_data_ptr() handles tensor materialization internally
         return conv1d_forward(input, weight, bias, s, p, d, groups)
     return F.conv1d(input, weight, bias, stride, padding, dilation, groups)
 
@@ -78,10 +106,8 @@ def _make_conv1d_forward(orig_forward):
             s = [self.stride[0]]
             p = [self.padding[0]]
             d = [self.dilation[0]]
-            # Pass self.weight directly — C++ materializes if needed
             return conv1d_forward(input, self.weight, self.bias, s, p, d, self.groups)
         except RuntimeError as e:
-            # Fallback to original PyTorch conv (slow but safe)
             import logging
             logging.getLogger("miopen_conv_fix").debug(
                 f"Fallback to PyTorch conv: {e}"
