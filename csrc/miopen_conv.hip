@@ -189,34 +189,25 @@ struct ConvDesc {
     }
 };
 
-// ---- Immediate Mode solution selection with validation ----
+// ---- Immediate Mode solution selection ----
 //
 // Instead of miopenFind*Algorithm (which runs benchmark kernels that can
 // segfault on immature architectures like gfx1201), we use the Immediate
-// Mode API: enumerate solutions by heuristic ranking, compile, validate
-// against PyTorch's native conv (slow but correct), and cache the first
-// solution that produces matching output.
+// Mode API: enumerate solutions by heuristic ranking, pick the best
+// non-blacklisted one, compile it, and cache the selection.
 
 struct SolutionCallbacks {
-    // Immediate Mode API calls (bound to descriptors by caller)
     std::function<miopenStatus_t(size_t*)> get_count;
     std::function<miopenStatus_t(size_t, size_t*, miopenConvSolution_t*)> get_solutions;
     std::function<miopenStatus_t(uint64_t)> compile;
-    std::function<miopenStatus_t(void*, size_t, uint64_t)> execute;
-    // Reference output via PyTorch's own conv (workspace=0 path — slow but correct)
-    std::function<torch::Tensor()> reference;
 };
 
-static CachedAlgo find_validated_solution(
+static CachedAlgo select_solution(
     const ConvKey& key,
-    torch::Tensor& output_2d,
-    const torch::TensorOptions& alloc_opts,
-    miopenDataType_t dtype,
     const SolutionCallbacks& cb
 ) {
     std::string arch = get_gcn_arch_name();
 
-    // 1. Get available solutions (heuristic-ranked, no benchmark kernels run)
     size_t solution_count = 0;
     MIOPEN_CHECK(cb.get_count(&solution_count));
     if (solution_count == 0) {
@@ -229,62 +220,18 @@ static CachedAlgo find_validated_solution(
     MIOPEN_CHECK(cb.get_solutions(solution_count, &returned, solutions.data()));
     solutions.resize(returned);
 
-    // 2. Compute reference output (PyTorch native path — uses naive kernel, always correct)
-    auto ref_output = cb.reference();
-
-    // 3. Try each solution: compile, execute, validate against reference
+    // Pick the best non-blacklisted solution
     for (size_t i = 0; i < solutions.size(); ++i) {
         uint64_t sid = solutions[i].solution_id;
 
         if (is_solution_blacklisted(arch, sid)) continue;
 
-        // Compile (optional but avoids latency on first Immediate call)
         miopenStatus_t compile_status = cb.compile(sid);
         if (compile_status != miopenStatusSuccess) continue;
 
-        // Allocate workspace and execute
-        size_t ws_size = solutions[i].workspace_size;
-        auto ws = torch::empty({static_cast<int64_t>(ws_size)},
-                                alloc_opts.dtype(torch::kByte));
-
-        output_2d.zero_();
-        miopenStatus_t exec_status = cb.execute(ws.data_ptr(), ws_size, sid);
-
-        // Sync to surface async GPU errors from broken kernels
-        hipError_t sync_status = hipDeviceSynchronize();
-
-        if (exec_status != miopenStatusSuccess || sync_status != hipSuccess) {
-            // Broken kernel — blacklist and try next
-            {
-                std::lock_guard<std::mutex> bl(blacklist_mutex);
-                solver_blacklist[arch].insert(sid);
-            }
-            continue;
-        }
-
-        // Numerical validation
-        bool match;
-        auto out_squeezed = output_2d.squeeze(2);
-        if (dtype == miopenFloat) {
-            match = torch::allclose(out_squeezed, ref_output, 1e-4, 1e-5);
-        } else {
-            // fp16/bf16: wider tolerance
-            match = torch::allclose(
-                out_squeezed.to(torch::kFloat),
-                ref_output.to(torch::kFloat),
-                1e-2, 1e-2);
-        }
-
-        if (!match) {
-            std::lock_guard<std::mutex> bl(blacklist_mutex);
-            solver_blacklist[arch].insert(sid);
-            continue;
-        }
-
-        // Valid — cache and return (output_2d already has the correct result)
         CachedAlgo cached;
         cached.solution_id = sid;
-        cached.workspace_size = ws_size;
+        cached.workspace_size = solutions[i].workspace_size;
         cached.valid = true;
 
         {
@@ -296,7 +243,7 @@ static CachedAlgo find_validated_solution(
 
     throw std::runtime_error(
         "MIOpen: all " + std::to_string(solutions.size()) +
-        " conv solutions failed validation on " + arch +
+        " solutions blacklisted or failed to compile on " + arch +
         ". Falling back to PyTorch native conv.");
 }
 
@@ -364,7 +311,6 @@ torch::Tensor miopen_conv1d_forward(
     }
 
     if (!cached.valid) {
-        // First call for this shape — validate solutions via Immediate Mode API
         SolutionCallbacks cb;
         cb.get_count = [&](size_t* count) {
             return miopenConvolutionForwardGetSolutionCount(
@@ -378,36 +324,20 @@ torch::Tensor miopen_conv1d_forward(
             return miopenConvolutionForwardCompileSolution(
                 handle, w_desc.desc, x_desc.desc, conv_desc.desc, y_desc.desc, sid);
         };
-        cb.execute = [&](void* ws, size_t ws_size, uint64_t sid) {
-            float alpha = 1.0f, beta = 0.0f;
-            return miopenConvolutionForwardImmediate(
-                handle, w_desc.desc, weight_2d.data_ptr(),
-                x_desc.desc, input_2d.data_ptr(),
-                conv_desc.desc,
-                y_desc.desc, output_2d.data_ptr(),
-                ws, ws_size, sid);
-        };
-        cb.reference = [&]() -> torch::Tensor {
-            return at::conv1d(input_c, weight_c, /*bias=*/{},
-                              /*stride=*/{s}, /*padding=*/{p},
-                              /*dilation=*/{d}, /*groups=*/g);
-        };
 
-        cached = find_validated_solution(key, output_2d, input_c.options(), dtype, cb);
-        // output_2d already contains the validated result
-    } else {
-        // Cache hit — execute with known-good solution
-        auto workspace = torch::empty({static_cast<int64_t>(cached.workspace_size)},
-                                       input_c.options().dtype(torch::kByte));
-        float alpha = 1.0f, beta = 0.0f;
-        MIOPEN_CHECK(miopenConvolutionForwardImmediate(
-            handle, w_desc.desc, weight_2d.data_ptr(),
-            x_desc.desc, input_2d.data_ptr(),
-            conv_desc.desc,
-            y_desc.desc, output_2d.data_ptr(),
-            workspace.data_ptr(), cached.workspace_size,
-            cached.solution_id));
+        cached = select_solution(key, cb);
     }
+
+    // Execute with workspace
+    auto workspace = torch::empty({static_cast<int64_t>(cached.workspace_size)},
+                                   input_c.options().dtype(torch::kByte));
+    MIOPEN_CHECK(miopenConvolutionForwardImmediate(
+        handle, w_desc.desc, weight_2d.data_ptr(),
+        x_desc.desc, input_2d.data_ptr(),
+        conv_desc.desc,
+        y_desc.desc, output_2d.data_ptr(),
+        workspace.data_ptr(), cached.workspace_size,
+        cached.solution_id));
 
     auto output = output_2d.squeeze(2);
 
@@ -500,35 +430,20 @@ torch::Tensor miopen_conv_transpose1d_forward(
             return miopenConvolutionBackwardDataCompileSolution(
                 handle, dy_desc.desc, w_desc.desc, conv_desc.desc, dx_desc.desc, sid);
         };
-        cb.execute = [&](void* ws, size_t ws_size, uint64_t sid) {
-            float alpha = 1.0f, beta = 0.0f;
-            return miopenConvolutionBackwardDataImmediate(
-                handle, dy_desc.desc, input_2d.data_ptr(),
-                w_desc.desc, weight_2d.data_ptr(),
-                conv_desc.desc,
-                dx_desc.desc, output_2d.data_ptr(),
-                ws, ws_size, sid);
-        };
-        cb.reference = [&]() -> torch::Tensor {
-            return at::conv_transpose1d(input_c, weight_c, /*bias=*/{},
-                                         /*stride=*/{s}, /*padding=*/{p},
-                                         /*output_padding=*/{op}, /*groups=*/g,
-                                         /*dilation=*/{d});
-        };
 
-        cached = find_validated_solution(key, output_2d, input_c.options(), dtype, cb);
-    } else {
-        auto workspace = torch::empty({static_cast<int64_t>(cached.workspace_size)},
-                                       input_c.options().dtype(torch::kByte));
-        float alpha = 1.0f, beta = 0.0f;
-        MIOPEN_CHECK(miopenConvolutionBackwardDataImmediate(
-            handle, dy_desc.desc, input_2d.data_ptr(),
-            w_desc.desc, weight_2d.data_ptr(),
-            conv_desc.desc,
-            dx_desc.desc, output_2d.data_ptr(),
-            workspace.data_ptr(), cached.workspace_size,
-            cached.solution_id));
+        cached = select_solution(key, cb);
     }
+
+    // Execute with workspace
+    auto workspace = torch::empty({static_cast<int64_t>(cached.workspace_size)},
+                                   input_c.options().dtype(torch::kByte));
+    MIOPEN_CHECK(miopenConvolutionBackwardDataImmediate(
+        handle, dy_desc.desc, input_2d.data_ptr(),
+        w_desc.desc, weight_2d.data_ptr(),
+        conv_desc.desc,
+        dx_desc.desc, output_2d.data_ptr(),
+        workspace.data_ptr(), cached.workspace_size,
+        cached.solution_id));
 
     auto output = output_2d.squeeze(2);
 
